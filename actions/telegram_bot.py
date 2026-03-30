@@ -43,11 +43,11 @@ _ENV_PATH = _BASE_DIR / "server" / ".env"
 def _load_config() -> dict:
     load_dotenv(_ENV_PATH, override=True)
     return {
-        "bot_token":       os.getenv("TELEGRAM_BOT_TOKEN", ""),
-        "nvidia_api_key":  os.getenv("NVIDIA_API_KEY", ""),
-        "nvidia_base_url": os.getenv("NVIDIA_EMBED_URL", "https://integrate.api.nvidia.com/v1").rstrip("/"),
-        "chat_model":      os.getenv("NVIDIA_CHAT_MODEL", "nvidia/llama-3.3-nemotron-super-49b-v1"),
-        "screenshot_dir":  os.getenv("SCREENSHOT_DIR", str(Path.home() / "Pictures" / "Wall_E_Screenshots")),
+        "bot_token":       os.getenv("TELEGRAM_BOT_TOKEN"),
+        "nvidia_api_key":  os.getenv("NVIDIA_API_KEY"),
+        "nvidia_base_url": os.getenv("NVIDIA_EMBED_URL").rstrip("/"),
+        "chat_model":      os.getenv("NVIDIA_CHAT_MODEL"),
+        "screenshot_dir":  os.getenv("SCREENSHOT_DIR"),
     }
 
 # ── Shared tools (import from main project) ───────────────
@@ -109,21 +109,85 @@ def _is_screenshot_request(text: str) -> bool:
     lower = text.lower()
     return any(kw in lower for kw in _SCREENSHOT_KEYWORDS)
 
+# ── Memory ────────────────────────────────────────────────
+
+def _build_system_prompt() -> str:
+    """Build system prompt with user memory (same data as Gemini voice)."""
+    sys.path.insert(0, str(_BASE_DIR))
+    from memory.memory_manager import load_memory, format_memory_for_prompt
+    from datetime import datetime as dt
+
+    memory = load_memory()
+    memory_block = format_memory_for_prompt(memory)
+    now = dt.now().strftime("%Y-%m-%d %H:%M (%A)")
+
+    prompt = (
+        "You are Wall-E, a sharp and efficient AI assistant. "
+        "Calm, direct, professional. Address the user as 'sir'. "
+        "Keep responses concise (2-3 sentences max). "
+        "Respond in the same language the user writes in. "
+        "You have access to tools to control the computer, search the web, "
+        "manage files, open apps, and more. Use them when appropriate. "
+        "Always call the appropriate tool — never simulate or guess results. "
+        "If the task can be done in ONE action, use the specific tool. "
+        "If it needs multiple steps, use agent_task.\n"
+        f"Current date/time: {now}\n"
+    )
+
+    if memory_block:
+        prompt += f"\n{memory_block}\n"
+
+    return prompt
+
+
+def _update_memory_from_chat(user_text: str, bot_reply: str, config: dict):
+    """Extract personal facts from conversation and save to memory (async, non-blocking)."""
+    import threading
+    sys.path.insert(0, str(_BASE_DIR))
+    from memory.memory_manager import update_memory
+
+    def _extract():
+        extract_prompt = (
+            "Extract personal facts from this conversation.\n"
+            "Return ONLY valid JSON (no markdown) with this structure:\n"
+            '{"identity": {}, "preferences": {}, "relationships": {}, "notes": {}}\n'
+            "Each value should be a simple string. Only include NEW facts.\n"
+            'If nothing to extract, return exactly: {}\n\n'
+            f"User: {user_text}\nAssistant: {bot_reply}"
+        )
+
+        url = f"{config['nvidia_base_url']}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {config['nvidia_api_key']}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": config["chat_model"],
+            "messages": [{"role": "user", "content": extract_prompt}],
+            "temperature": 0.1,
+            "max_tokens": 256,
+        }
+
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"] or ""
+            raw = raw.strip().strip("`").strip()
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+            data = json.loads(raw)
+            if data and isinstance(data, dict):
+                update_memory(data)
+        except Exception as e:
+            print(f"[Telegram] Memory update skipped: {e}")
+
+    threading.Thread(target=_extract, daemon=True).start()
+
+
 # ── NVIDIA NIM Chat with Tool Calling ─────────────────────
 
-_SYSTEM_PROMPT = (
-    "You are Wall-E, a sharp and efficient AI assistant. "
-    "Calm, direct, professional. Address the user as 'sir'. "
-    "Keep responses concise (2-3 sentences max). "
-    "Respond in the same language the user writes in. "
-    "You have access to tools to control the computer, search the web, "
-    "manage files, open apps, and more. Use them when appropriate. "
-    "Always call the appropriate tool — never simulate or guess results. "
-    "If the task can be done in ONE action, use the specific tool. "
-    "If it needs multiple steps, use agent_task."
-)
-
-MAX_TOOL_ROUNDS = 5  # Prevent infinite tool-call loops
+MAX_TOOL_ROUNDS = 5
 
 
 def _chat_with_tools(user_text: str, config: dict, openai_tools: list[dict]) -> str:
@@ -138,12 +202,13 @@ def _chat_with_tools(user_text: str, config: dict, openai_tools: list[dict]) -> 
         "Content-Type": "application/json",
     }
 
+    system_prompt = _build_system_prompt()
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
     ]
 
-    for _ in range(MAX_TOOL_ROUNDS):
+    for round_num in range(MAX_TOOL_ROUNDS):
         payload = {
             "model": config["chat_model"],
             "messages": messages,
@@ -167,16 +232,49 @@ def _chat_with_tools(user_text: str, config: dict, openai_tools: list[dict]) -> 
         data = response.json()
         choice = data["choices"][0]
         msg = choice["message"]
+        finish_reason = choice.get("finish_reason", "")
 
-        # If no tool calls, return the text response
+        # Debug: dump raw response
+        print(f"[Telegram] 🔍 Round {round_num+1} | finish_reason={finish_reason} | "
+              f"content={repr(msg.get('content'))[:80]} | "
+              f"tool_calls={len(msg.get('tool_calls') or [])}")
+
         tool_calls = msg.get("tool_calls")
-        if not tool_calls:
-            return msg.get("content", "Done.").strip()
+        content = msg.get("content")
 
-        # Append assistant message with tool calls
+        # Case 1: Model returned text content (no tool calls)
+        if content and not tool_calls:
+            return content.strip()
+
+        # Case 2: No tool calls AND no content — retry without tools
+        if not tool_calls and not content:
+            print("[Telegram] ⚠️ Empty response — retrying without tools")
+            plain_payload = {
+                "model": config["chat_model"],
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 1024,
+            }
+            try:
+                with httpx.Client(timeout=60.0) as client:
+                    resp2 = client.post(url, headers=headers, json=plain_payload)
+                    resp2.raise_for_status()
+                data2 = resp2.json()
+                plain_msg = data2["choices"][0]["message"]
+                print(f"[Telegram] 📝 Fallback raw: {repr(plain_msg.get('content'))[:120]}")
+                fallback_content = plain_msg.get("content") or ""
+                # Some NIM models put <think>...</think> before the actual response
+                if "<think>" in fallback_content:
+                    import re
+                    fallback_content = re.sub(r"<think>.*?</think>", "", fallback_content, flags=re.DOTALL).strip()
+                return fallback_content.strip() if fallback_content.strip() else "I'm here, sir. How can I help?"
+            except Exception as e:
+                print(f"[Telegram] ❌ Fallback failed: {e}")
+                return "⚠️ Could not get a response. Please try again."
+
+        # Case 3: Tool calls present — execute them
         messages.append(msg)
 
-        # Execute each tool call and feed results back
         for tc in tool_calls:
             func_name = tc["function"]["name"]
             try:
@@ -184,16 +282,16 @@ def _chat_with_tools(user_text: str, config: dict, openai_tools: list[dict]) -> 
             except (json.JSONDecodeError, TypeError):
                 func_args = {}
 
-            logger.info(f"Tool call: {func_name}({func_args})")
+            print(f"[Telegram] 🔧 Tool: {func_name} | Args: {func_args}")
             result = _execute_tool(func_name, func_args)
+            print(f"[Telegram] 📤 Result: {str(result)[:100]}")
 
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
-                "content": str(result)[:2000],  # Cap result length
+                "content": str(result)[:2000],
             })
 
-    # If we exhausted rounds, return what we have
     return "I completed the actions. Let me know if you need anything else, sir."
 
 # ── Telegram Handlers ─────────────────────────────────────
@@ -245,6 +343,9 @@ def _build_app(config: dict, openai_tools: list[dict]):
             chat_id=update.effective_chat.id, action="typing"
         )
         reply = _chat_with_tools(text, config, openai_tools)
+
+        # Update memory in background (non-blocking)
+        _update_memory_from_chat(text, reply, config)
 
         # Split long replies (Telegram limit: 4096 chars)
         if len(reply) > 4000:
