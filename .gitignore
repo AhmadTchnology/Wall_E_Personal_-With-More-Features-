@@ -1,0 +1,10 @@
+/config/api_keys.json
+__pycache__
+/actions/__pycache__
+/agent/__pycache__
+.agent
+/memory/__pycache__
+wall-e-ui.md
+PROJECT_ANALYSIS.md
+.vscode
+server/.env
