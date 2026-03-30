@@ -18,3 +18,5 @@ win10toast
 duckduckgo-search
 youtube-transcript-api
 httpx
+python-telegram-bot
+python-dotenv

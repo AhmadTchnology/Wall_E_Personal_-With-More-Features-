@@ -876,6 +876,13 @@ def main():
     def runner():
         ui.wait_for_api_key()
         
+        # Start Telegram bot (NVIDIA NIM) alongside voice (Gemini)
+        try:
+            from actions.telegram_bot import start_telegram_bot
+            start_telegram_bot()
+        except Exception as e:
+            print(f"[Wall-E] ⚠️ Telegram bot failed to start: {e}")
+
         wall_e = WallELive(ui)
         try:
             asyncio.run(wall_e.run())
